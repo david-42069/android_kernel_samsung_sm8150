@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
 
+# If instrumentation of this dir is enabled, the function tracer gets really
+# slow. Probably could be more selective here, but note that files related
+# to tracing.shouldn't be traced anyway.
+KCOV_INSTRUMENT		:= n
+
 # Do not instrument the tracer itself:
 
 ifdef CONFIG_FUNCTION_TRACER
@@ -73,4 +78,9 @@ obj-$(CONFIG_GPU_TRACEPOINTS) += gpu-traces.o
 
 obj-$(CONFIG_TRACEPOINT_BENCHMARK) += trace_benchmark.o
 
+obj-$(CONFIG_QCOM_RTB) += msm_rtb.o
+obj-$(CONFIG_IPC_LOGGING) += ipc_logging.o
+ifdef CONFIG_DEBUG_FS
+obj-$(CONFIG_IPC_LOGGING) += ipc_logging_debug.o
+endif
 libftrace-y := ftrace.o

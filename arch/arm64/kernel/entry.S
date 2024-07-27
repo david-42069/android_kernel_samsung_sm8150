@@ -37,6 +37,10 @@
 #include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
 
+#ifdef CONFIG_RKP_CFP_ROPP
+#include <asm/rkp_cfp.h>
+#endif
+
 /*
  * Context tracking subsystem.  Used to instrument transitions
  * between user and kernel mode.
@@ -142,18 +146,17 @@ alternative_else_nop_endif
 	// to save/restore them if required.
 	.macro	apply_ssbd, state, targ, tmp1, tmp2
 #ifdef CONFIG_ARM64_SSBD
-alternative_cb	arm64_enable_wa2_handling
-	b	\targ
-alternative_cb_end
+	ldr	\tmp1, =ssbd_state
+	ldr	\tmp1, [\tmp1]
+	cmp	\tmp1, #ARM64_SSBD_KERNEL
+	b.ne	\targ
 	ldr_this_cpu	\tmp2, arm64_ssbd_callback_required, \tmp1
 	cbz	\tmp2, \targ
 	ldr	\tmp2, [tsk, #TSK_TI_FLAGS]
 	tbnz	\tmp2, #TIF_SSBD, \targ
 	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_2
 	mov	w1, #\state
-alternative_cb	arm64_update_smccc_conduit
-	nop					// Patched to SMC/HVC #0
-alternative_cb_end
+	smc	#0
 #endif
 	.endm
 
@@ -169,6 +172,11 @@ alternative_cb_end
 	stp	x10, x11, [sp, #16 * 5]
 	stp	x12, x13, [sp, #16 * 6]
 	stp	x14, x15, [sp, #16 * 7]
+#if (defined CONFIG_RKP_CFP_ROPP) && (!defined CONFIG_RKP_CFP_TEST)
+	.if	\el == 1
+	mov	RRK, xzr
+	.endif
+#endif
 	stp	x16, x17, [sp, #16 * 8]
 	stp	x18, x19, [sp, #16 * 9]
 	stp	x20, x21, [sp, #16 * 10]
@@ -181,6 +189,9 @@ alternative_cb_end
 	mrs	x21, sp_el0
 	ldr_this_cpu	tsk, __entry_task, x20	// Ensure MDSCR_EL1.SS is clear,
 	ldr	x19, [tsk, #TSK_TI_FLAGS]	// since we can unmask debug
+#ifdef CONFIG_RKP_CFP_ROPP
+	ropp_new_key	tsk
+#endif
 	disable_step_tsk x19, x20		// exceptions when scheduling.
 
 	apply_ssbd 1, 1f, x22, x23
@@ -206,6 +217,9 @@ alternative_cb_end
 	mov	x20, #USER_DS
 	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 	/* No need to reset PSTATE.UAO, hardware's already set it to 0 for us */
+#ifdef CONFIG_RKP_CFP_ROPP
+	ropp_load_key 	tsk
+#endif
 	.endif /* \el == 0 */
 	mrs	x22, elr_el1
 	mrs	x23, spsr_el1
@@ -355,6 +369,13 @@ alternative_else_nop_endif
 	ldp	x12, x13, [sp, #16 * 6]
 	ldp	x14, x15, [sp, #16 * 7]
 	ldp	x16, x17, [sp, #16 * 8]
+#ifdef CONFIG_RKP_CFP_ROPP
+	.if	\el == 1
+	/* Might be having an interrupt right after smc call, before any RRK loading code */
+	get_thread_info	x19
+	ropp_load_key 	x19
+	.endif
+#endif
 	ldp	x18, x19, [sp, #16 * 9]
 	ldp	x20, x21, [sp, #16 * 10]
 	ldp	x22, x23, [sp, #16 * 11]
@@ -626,7 +647,7 @@ el1_undef:
 	enable_dbg
 	mov	x0, sp
 	bl	do_undefinstr
-	ASM_BUG()
+	kernel_exit 1
 el1_dbg:
 	/*
 	 * Debug exception handling
@@ -732,9 +753,9 @@ el0_sync_compat:
 	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL0
 	b.eq	el0_undef
 	cmp	x24, #ESR_ELx_EC_CP15_32	// CP15 MRC/MCR trap
-	b.eq	el0_undef
+	b.eq	el0_cp15_32_compat
 	cmp	x24, #ESR_ELx_EC_CP15_64	// CP15 MRRC/MCRR trap
-	b.eq	el0_undef
+	b.eq	el0_cp15_64_compat
 	cmp	x24, #ESR_ELx_EC_CP14_MR	// CP14 MRC/MCR trap
 	b.eq	el0_undef
 	cmp	x24, #ESR_ELx_EC_CP14_LS	// CP14 LDC/STC trap
@@ -752,6 +773,28 @@ el0_svc_compat:
 	mov	wscno, w7			// syscall number in w7 (r7)
 	mov     wsc_nr, #__NR_compat_syscalls
 	b	el0_svc_naked
+
+el0_cp15_32_compat:
+	/*
+	 * AArch32 CP15 MRC/MCR trap handling
+	 */
+	enable_dbg_and_irq
+	ct_user_exit
+	mov	x0, x25
+	mov	x1, sp
+	bl	do_cp15_32_instr_compat
+	b	ret_to_user
+
+el0_cp15_64_compat:
+	/*
+	 * AArch32 CP15 MRRC/MCRR trap handling
+	 */
+	enable_dbg_and_irq
+	ct_user_exit
+	mov	x0, x25
+	mov	x1, sp
+	bl	do_cp15_64_instr_compat
+	b	ret_to_user
 
 	.align	6
 el0_irq_compat:
@@ -948,6 +991,30 @@ el0_svc_naked:					// compat entry point
 	cmp     wscno, wsc_nr			// check upper syscall limit
 	b.hs	ni_sys
 	mask_nospec64 xscno, xsc_nr, x19	// enforce bounds for syscall number
+#ifdef CONFIG_SECURITY_DEFEX
+/*
+ * Defex enter hook
+ */
+
+	ldr	x16, =defex_syscall_catch_enter
+	ldr	x16, [x16]
+	cmp	x16, xzr
+	b.eq	2f
+	mov	x0, xscno
+	mov	x1, sp
+	blr	x16
+
+	cbnz	w0, ret_fast_syscall		// block this syscall?
+#	adr	lr, ret_fast_syscall		// return address (not needed here)
+
+	ldp	x0, x1, [sp]			// restore the syscall args
+	ldp	x2, x3, [sp, #S_X2]
+	ldp	x4, x5, [sp, #S_X4]
+	ldp	x6, x7, [sp, #S_X6]
+
+2:
+#endif
+
 	ldr	x16, [stbl, xscno, lsl #3]	// address in the syscall table
 	blr	x16				// call sys_* routine
 	b	ret_fast_syscall
@@ -974,6 +1041,23 @@ __sys_trace:
 	mov	x1, sp				// pointer to regs
 	cmp	wscno, wsc_nr			// check upper syscall limit
 	b.hs	__ni_sys_trace
+#ifdef CONFIG_SECURITY_DEFEX
+/*
+ * Defex enter hook
+ */
+
+	ldr	x16, =defex_syscall_catch_enter
+	ldr	x16, [x16]
+	cmp	x16, xzr
+	b.eq	3f
+	mov	x0, xscno
+	mov	x1, sp
+	blr	x16
+
+	cbnz	w0, __sys_trace_return		// block this syscall?
+#	adr	lr, __sys_trace_return		// return address (not neede here)
+3:
+#endif
 	ldp	x0, x1, [sp]			// restore the syscall args
 	ldp	x2, x3, [sp, #S_X2]
 	ldp	x4, x5, [sp, #S_X4]
@@ -1143,6 +1227,13 @@ ENTRY(cpu_switch_to)
 	ldr	lr, [x8]
 	mov	sp, x9
 	msr	sp_el0, x1
+#ifdef CONFIG_RKP_CFP_ROPP
+	/*
+	 * Must be after sp updated
+	 * x1 holds thread_info addr
+	 */
+	ropp_load_key	x1
+#endif
 #ifdef CONFIG_SHADOW_CALL_STACK
 	str	x18, [x0, #TSK_TI_SCS]
 	ldr	x18, [x1, #TSK_TI_SCS]
